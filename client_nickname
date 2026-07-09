@@ -1,0 +1,117 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <pthread.h>
+
+#define BUFSIZE 1024
+#define NAMESIZE 32
+
+// 닉네임과 소켓 정보를 같이 넘기기 위한 구조체
+typedef struct {
+    int sock;
+    char name[NAMESIZE];
+} ClientInfo;
+
+void error_handling(const char *message)
+{
+    fputs(message, stderr);
+    fputc('\n', stderr);
+    exit(-1);
+}
+
+// 데이터를 보내는 스레드 함수
+void* send_msg(void* arg)
+{
+    ClientInfo* info = (ClientInfo*)arg;
+    char msg[BUFSIZE];
+    char name_msg[BUFSIZE + NAMESIZE]; // 닉네임 + 메시지를 담을 버퍼
+
+    while(1)
+    {
+        fgets(msg, BUFSIZE, stdin);
+        
+        if(!strcmp(msg, "q\n") || !strcmp(msg, "Q\n"))
+        {
+            close(info->sock);
+            free(info);
+            exit(0);
+        }
+        
+        // 닉네임: 메시지 형태로 문자열을 합성합니다. (예: [Cheolsoo]: Hello)
+        sprintf(name_msg, "[%s]: %s", info->name, msg);
+        write(info->sock, name_msg, strlen(name_msg));
+    }
+    return NULL;
+}
+
+// 데이터를 받는 스레드 함수
+void* recv_msg(void* arg)
+{
+    ClientInfo* info = (ClientInfo*)arg;
+    char msg[BUFSIZE + NAMESIZE];
+    int str_len;
+
+    while(1)
+    {
+        str_len = read(info->sock, msg, sizeof(msg) - 1);
+        if(str_len <= 0) 
+        {
+            free(info);
+            return (void*)-1;
+        }
+        msg[str_len] = '\0';
+        fputs(msg, stdout);
+    }
+    return NULL;
+}
+
+int main(int argc, char* argv[])
+{
+    int sock;
+    struct sockaddr_in serv_addr;
+    pthread_t snd_thread, rcv_thread;
+    void* thread_return;
+
+    // 인자 개수를 4개로 변경 (<IP> <port> <nickname>)
+    if(argc != 4) {
+        printf("Usage : %s <IP> <port> <nickname>\n", argv[0]);
+        exit(1);
+    }
+
+    sock = socket(PF_INET, SOCK_STREAM, 0);
+    if(-1 == sock){
+        error_handling("socket() error");
+    }
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
+    serv_addr.sin_port = htons(atoi(argv[2]));
+
+    if(-1 == connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr))) {
+        error_handling("connect() error");
+    }
+
+    // 스레드에 소켓과 닉네임을 함께 넘겨주기 위해 구조체 동적 할당
+    ClientInfo* info1 = (ClientInfo*)malloc(sizeof(ClientInfo));
+    ClientInfo* info2 = (ClientInfo*)malloc(sizeof(ClientInfo));
+    
+    info1->sock = sock;
+    strcpy(info1->name, argv[3]);
+    
+    info2->sock = sock;
+    strcpy(info2->name, argv[3]);
+
+    pthread_create(&snd_thread, NULL, send_msg, info1);
+    pthread_create(&rcv_thread, NULL, recv_msg, info2);
+
+    pthread_join(snd_thread, &thread_return);
+    pthread_join(rcv_thread, &thread_return);
+
+    close(sock);
+    return 0;
+}
