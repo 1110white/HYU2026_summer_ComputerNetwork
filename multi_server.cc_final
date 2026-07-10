@@ -1,0 +1,202 @@
+/**
+ * @file multi_server.cc
+ * @brief AI 협업 기반 멀티스레드 채팅 서버 (확장 버전)
+ * 
+ * [사용자 관점 설계 포인트]
+ * 1. 동시성 보장: pthread_mutex를 도입하여 여러 클라이언트가 동시에 접속/퇴장할 때 발생할 수 있는 데이터 오염을 방지.
+ * 2. 상태 관리: 소켓 번호와 닉네임을 구조체로 묶어 관리함으로써 귓속말 대상 탐색 및 퇴장 알림 시 누군지 명확히 식별 가능.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <pthread.h>
+#include <time.h>
+
+#define BUFSIZE 1024
+#define MAX_CLIENT 64
+#define NAMESIZE 32
+
+// 클라이언트 정보를 저장할 구조체
+typedef struct {
+    int sock;
+    char name[NAMESIZE];
+} ClientInfo;
+
+ClientInfo clnt_info[MAX_CLIENT];
+int clnt_cnt = 0;
+pthread_mutex_t mutx; // 동기화를 위한 뮤텍스
+
+void error_handling(const char *message) {
+    fputs(message, stderr);
+    fputc('\n', stderr);
+    exit(-1);
+}
+
+// 현재 시간을 [HH:MM:SS] 형태로 반환하는 함수
+void get_current_time(char* time_buf) {
+    time_t raw_time;
+    struct tm* time_info;
+    time(&raw_time);
+    time_info = localtime(&raw_time);
+    sprintf(time_buf, "[%02d:%02d:%02d]", time_info->tm_hour, time_info->tm_min, time_info->tm_sec);
+}
+
+// 모든 클라이언트에게 브로드캐스트 (텍스트 색상 추가)
+void send_msg(char* msg, int len) {
+    pthread_mutex_lock(&mutx);
+    for (int i = 0; i < clnt_cnt; i++) {
+        write(clnt_info[i].sock, msg, len);
+    }
+    pthread_mutex_unlock(&mutx);
+}
+
+void* handle_clnt(void* arg) {
+    int clnt_sock = *(int*)arg;
+    free(arg);
+
+    int str_len = 0;
+    char msg[BUFSIZE];
+    char send_buf[BUFSIZE + 100];
+    char time_buf[20];
+    char my_name[NAMESIZE] = {0,};
+
+    while ((str_len = read(clnt_sock, msg, sizeof(msg) - 1)) > 0) {
+        msg[str_len] = '\0';
+        get_current_time(time_buf);
+
+        // 1. 최초 접속 및 닉네임 등록 프로토콜 [JOIN]
+        if (strncmp(msg, "[JOIN]", 6) == 0) {
+            strcpy(my_name, msg + 6);
+            
+            pthread_mutex_lock(&mutx);
+            for(int i=0; i<clnt_cnt; i++) {
+                if(clnt_info[i].sock == clnt_sock) {
+                    strcpy(clnt_info[i].name, my_name);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&mutx);
+
+            // 보라색(\033[1;35m)으로 접속 알림 브로드캐스트
+            sprintf(send_buf, "\033[1;35m%s %s 님이 입장하셨습니다.\033[0m\n", time_buf, my_name);
+            send_msg(send_buf, strlen(send_buf));
+            printf("%s [JOIN] %s (Socket %d)\n", time_buf, my_name, clnt_sock);
+        }
+        // 2. 귓속말 프로토콜 [WHISPER]대상|내용
+        else if (strncmp(msg, "[WHISPER]", 9) == 0) {
+            char* target = msg + 9;
+            char* content = strchr(target, '|');
+            if (content != NULL) {
+                *content = '\0';
+                content++; // 실제 내용 시작점
+
+                int send_success = 0;
+                pthread_mutex_lock(&mutx);
+                for (int i = 0; i < clnt_cnt; i++) {
+                    if (strcmp(clnt_info[i].name, target) == 0) {
+                        // 시안색(\033[1;36m)으로 귓속말 전송
+                        sprintf(send_buf, "\033[1;36m%s (귓속말)%s: %s\033[0m", time_buf, my_name, content);
+                        write(clnt_info[i].sock, send_buf, strlen(send_buf));
+                        send_success = 1;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&mutx);
+
+                // 귓속말 보낸 본인에게도 기록 표시
+                if (send_success) {
+                    sprintf(send_buf, "\033[1;36m%s %s 에게 보낸 귓속말: %s\033[0m", time_buf, target, content);
+                    write(clnt_sock, send_buf, strlen(send_buf));
+                } else {
+                    sprintf(send_buf, "\033[1;31m%s 존재하지 않는 닉네임입니다.\033[0m\n", time_buf);
+                    write(clnt_sock, send_buf, strlen(send_buf));
+                }
+            }
+        }
+        // 3. 일반 메시지 [MSG]
+        else if (strncmp(msg, "[MSG]", 5) == 0) {
+            // 다른 사람들에게는 노란색으로 이름 표시
+            sprintf(send_buf, "%s \033[1;33m%s\033[0m: %s", time_buf, my_name, msg + 5);
+            
+            pthread_mutex_lock(&mutx);
+            for (int i = 0; i < clnt_cnt; i++) {
+                if (clnt_info[i].sock != clnt_sock) { // 나 제외 브로드캐스트
+                    write(clnt_info[i].sock, send_buf, strlen(send_buf));
+                }
+            }
+            pthread_mutex_unlock(&mutx);
+        }
+    }
+
+    // 클라이언트 퇴장 처리
+    pthread_mutex_lock(&mutx);
+    get_current_time(time_buf);
+    sprintf(send_buf, "\033[1;35m%s %s 님이 퇴장하셨습니다.\033[0m\n", time_buf, my_name);
+    
+    for (int i = 0; i < clnt_cnt; i++) {
+        if (clnt_sock == clnt_info[i].sock) {
+            while (i < clnt_cnt - 1) {
+                clnt_info[i] = clnt_info[i + 1];
+                i++;
+            }
+            break;
+        }
+    }
+    clnt_cnt--;
+    pthread_mutex_unlock(&mutx);
+
+    send_msg(send_buf, strlen(send_buf));
+    printf("%s [LEAVE] %s (Socket %d)\n", time_buf, my_name, clnt_sock);
+    close(clnt_sock);
+    return NULL;
+}
+
+int main(int argc, char* argv[]) {
+    int serv_sock, clnt_sock;
+    pthread_t t_id;
+    struct sockaddr_in serv_addr, clnt_addr;
+    unsigned int clnt_addr_size;
+
+    if (argc != 2) {
+        printf("Usage : %s <port>\n", argv[0]);
+        exit(1);
+    }
+
+    pthread_mutex_init(&mutx, NULL);
+    serv_sock = socket(PF_INET, SOCK_STREAM, 0);
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_port = htons(atoi(argv[1]));
+
+    if (bind(serv_sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1)
+        error_handling("bind() error");
+    if (listen(serv_sock, 5) == -1)
+        error_handling("listen() error");
+
+    clnt_addr_size = sizeof(clnt_addr);
+
+    while (1) {
+        clnt_sock = accept(serv_sock, (struct sockaddr*)&clnt_addr, &clnt_addr_size);
+        
+        pthread_mutex_lock(&mutx);
+        clnt_info[clnt_cnt].sock = clnt_sock;
+        strcpy(clnt_info[clnt_cnt].name, "Anonymous"); // 임시 이름
+        clnt_cnt++;
+        pthread_mutex_unlock(&mutx);
+
+        int* sock = (int*)malloc(sizeof(int));
+        *sock = clnt_sock;
+
+        pthread_create(&t_id, NULL, handle_clnt, sock);
+        pthread_detach(t_id);
+    }
+    pthread_mutex_destroy(&mutx);
+    return 0;
+}
